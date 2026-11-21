@@ -81,6 +81,7 @@
 #include "kern_tgl_same_tail.hpp"
 #include "kern_tgl_submit_history.hpp"
 #include "kern_tgl_hang_select.hpp"
+#include "kern_tgl_blit_report.hpp"
 #include "kern_tgl_recovery.hpp"
 #include "kern_tgl_aux_call.hpp"
 
@@ -111,6 +112,9 @@ static bool tglHangPreStopReady=false;
 static uint32_t tglHangPreStopState;
 static TGLHangPreStop::Capture tglHangPreStopCapture{};
 static bool tglHangBlitDumpReady;
+using TGLBlitReportLog = void (*)(void *,const char *,...);
+static TGLBlitReportLog tglBlitReportLog;
+static TGLBlitReport::History tglBlitSubmissionHistory;
 static bool tglSameTailEnabled;
 static TGLSameTail::State tglSameTailState{},tglSameTailFailure{};
 static TGLSubmitHistory::History<> tglSubmitHistory;
@@ -12213,6 +12217,24 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			}
 			tglHangBlitDumpReady=hangOK && blitDumpLayout;
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLHangBlitDumpReady",tglHangBlitDumpReady);
+			// On the exact UHD 770 diagnostic target, append to the existing
+			// donor failure report. Qualify both private layouts independently.
+			const uint8_t blitBank[] {0xB8,1,0,0,0,0x2B,0x47,0x50,0x48,0xC1,0xE0,4,
+				0x48,0x8B,0x4C,7,0x30,0x4C,0x8B,0x29,0x48,0x8B,0x44,7,0x38};
+			const uint8_t blitLogHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x48,0x81,0xEC,0xF8,0,0,0};
+			const uint8_t blitLogBuffer[] {0x41,0x8B,0x86,0xB0,8,0,0,0x85,0xC0,0x0F,0x84,0x8B,0,0,0,
+				0x49,0x8B,0xBE,0xA8,8,0,0};
+			if(tglHangBlitDumpReady && hostOK && orgTGLHostSubmit &&
+			   xeProfile.identity==0x46808086 && !xeProfile.overridden() &&
+			   XELP::kernelOS(version)==XELP::OS::Tahoe &&
+			   patcher.solveSymbol<mach_vm_address_t>(index,"__ZN20IGHardwareRingBuffer9drvErrLogEPKcz",address,size)==address+0x43F4C &&
+			   !memcmp(reinterpret_cast<void *>(address+0x43F4C),blitLogHead,sizeof(blitLogHead)) &&
+			   !memcmp(reinterpret_cast<void *>(address+0x43FBB),blitLogBuffer,sizeof(blitLogBuffer)) &&
+			   !memcmp(reinterpret_cast<void *>(address+0x3A695),blitBank,sizeof(blitBank))) {
+				tglBlitReportLog=reinterpret_cast<TGLBlitReportLog>(address+0x43F4C);
+			}
+			patcher.clearError();
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLBlitReportReady",tglBlitReportLog!=nullptr);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLHangBatchCaptureReady",hangOK);
             // Exact failure-only wake call. Native STOP, wake ownership and all
             // other callers remain unchanged; no instrumentation in normal submits.
@@ -15796,6 +15818,28 @@ extern "C" void tglHangPreStopWake(void *owner,bool enable,unsigned domains,unsi
  tglHostClock(c.q+3);__atomic_store_n(&tglHangPreStopState,2U,__ATOMIC_RELEASE);
 }
 
+static uint64_t tglBlitRead(uint64_t address,void *out,unsigned size) {
+ return TGLHangPending::kernelRange(address,size) ? tglVM.nofault(address,reinterpret_cast<uint64_t>(out),size) : 0;
+}
+
+static __attribute__((noinline)) void tglRememberBlitSubmission(void *streamer) {
+ const auto &engine=tglCSBEngines[TGLHangSelect::Blit];
+ if(!tglBlitReportLog || engine.streamer!=streamer)return;
+ TGLBlitReport::remember(tglBlitSubmissionHistory,reinterpret_cast<uint64_t>(streamer),
+  reinterpret_cast<uint64_t>(tglHost.owner),engine.resets,tglBlitRead);
+}
+
+static void tglPersistBlitReport(void *ring,const TGLHangSelect::Selection &selection,const uint8_t *regs) {
+ if(!tglBlitReportLog)return;
+ const auto record=TGLBlitReport::capture(selection,regs,tglBlitSubmissionHistory,
+  tglCSBEngines[TGLHangSelect::Blit].resets,tglBlitRead);
+ TGLBlitReport::write(record,[&](const char *format,auto... args) {
+  // Use the caller's native report receiver. A selected alternate ring was
+  // only a nofault witness and must never receive this native call.
+  tglBlitReportLog(ring,format,args...);
+ });
+}
+
 void XE::wrapTGLHangRingDump(void *ring,void *registers) {
  // No new MMIO, remapping, forcewake or submission. Called by native hang
  // reporting before reset/retirement, never by a successful command path.
@@ -15817,6 +15861,7 @@ void XE::wrapTGLHangRingDump(void *ring,void *registers) {
   // Only the ring passed by the native caller may be dereferenced by the
   // native logger. A matching scheduler slot can supply a nofault witness.
   nativeDump=TGLHangSelect::nativeBlitDumpAllowed(blit);
+  tglPersistBlitReport(ring,blit,regs);
   if(slot<4) {
    TGLHangSelect::BlitWindow window{};
    TGLHangSelect::captureBlitWindow(window,blit,regs,read);
@@ -16244,6 +16289,7 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
    reinterpret_cast<uint64_t>(streamer),tglCSBEngines[0].resets,read,force);
  } else if(tglSameTailEnabled && streamer==tglCSBEngines[0].streamer)tglSameTailState.previous={};
  if(renderWakeOwner)tglSubmitHistoryRecord(renderWakeOwner,streamer,n,0);
+ tglRememberBlitSubmission(streamer);
  FunctionCast(wrapTGLHostSubmit,callbackXE->orgTGLHostSubmit)(streamer,flags);
  if(renderWakeOwner)tglSubmitHistoryRecord(renderWakeOwner,streamer,n,1);
  adlnQueueTraceSubmitFinish(queueTraceMask,renderWakeOwner);

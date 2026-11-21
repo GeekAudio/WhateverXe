@@ -29,6 +29,15 @@ the bounded nofault copy. An alternate slot can yield a command snapshot but
 does not authorize a native object call. The check does not model physical GPU
 registers, workloop serialization, kernel object lifetime or a live reset.
 
+The same check connects the Blit submission witness to the failure report
+formatter. Use the exact donor's inactive bank and published LRC tail. Match
+engine, context ID, ring start, length, tail and reset epoch before using an
+earlier snapshot. A matching live ring wins, and uncopied words stay masked.
+The fixture retires the slots and removes their memory before reporting. It
+also checks ring wrap, changed bytes, locked slots, stale tails and formatting
+within the donor's line limit. The native report writer and ReportCrash's
+on-disk persistence remain hardware integration boundaries.
+
 Apply these rules to implementation changes and test additions, corrections,
 merges and removals. An existing passing test is not an approved specification.
 The [check inventory](#independent-expectations-and-boundaries) describes selected

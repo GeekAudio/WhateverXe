@@ -1,13 +1,17 @@
 #include "kern_tgl_hang_select.hpp"
+#include "kern_tgl_blit_report.hpp"
 #include <cassert>
+#include <cstdio>
 #include <map>
+#include <string>
 #include <vector>
 using namespace TGLHangSelect;
 namespace {
 constexpr uint64_t K=0xffff800000000000ULL,Origin=K+0x1000,Other=K+0x2000,
  Stream=K+0x3000,Item=K+0x4000,Ctx=K+0x5000,Ring=K+0x6000,
  Item2=K+0x7000,Ctx2=K+0x8000,Ring2=K+0x9000,Owner=K+0x10000,
- Descriptor=K+0x11000,LRC=K+0x12000,Buffer=K+0x14000,Commands=K+0x15000;
+ Descriptor=K+0x11000,LRC=K+0x12000,Buffer=K+0x14000,Commands=K+0x15000,
+ LRCBuffer=K+0x16000;
 struct Fixture {
  std::map<uint64_t,std::vector<uint8_t>> mem;uint8_t regs[176]{};
  unsigned slotReads{};bool changeSlots{},changeOwner{},changeItem{},missingID{};
@@ -49,7 +53,97 @@ struct Fixture {
   });
   return out;
  }
+ void submittedBlit(uint32_t tail=0x228) {
+  blit();
+  mem[LRCBuffer].resize(4096);
+  put(Ctx+0x89,uint64_t(6)<<37 | 0x40100319);
+  put(Ctx+0x98,LRCBuffer);put(LRCBuffer+0x38,LRC);
+  put(LRC+0x101c,tail);
+  // Native submit reads the inactive bank (0 here). Bank +4 need not be zero.
+  put(Stream+0x50,uint32_t(1));put(Stream+0x54,uint32_t(0xfeed));
+  const uint32_t head=(tail+4096-60)&4095, control=0, ipehr=0x0e009002;
+  const uint32_t packet[]{ipehr,0x22,0x40000034,0};
+  for(unsigned i=0;i<4;++i)put(Commands+((head+4*i)&4095),packet[i]);
+  memcpy(regs,&head,4);memcpy(regs+4,&tail,4);memcpy(regs+8,&control,4);
+  memcpy(regs+0x7c,&ipehr,4);
+ }
+ void forgetSlots() {
+  put(Stream+0x30,uint64_t(0));put(Stream+0x40,uint64_t(0));
+ }
 };
+
+void persistentBlitReports() {
+ using namespace TGLBlitReport;
+ Fixture f;
+ f.submittedBlit();
+ History history{};
+ auto read=[&](uint64_t p,void *o,unsigned n){return f.read(p,o,n);};
+ remember(history,Stream,Owner,4,read);
+ auto live=capture(f.run(),f.regs,history,4,read);
+ assert(live.source==Source::Scheduler && live.words[8]==0x0e009002 && live.mask==0xffff);
+ f.forgetSlots();
+ // The old failure-only path must miss. The persisted report may use the
+ // earlier bank snapshot without reading memory from the departed context.
+ auto absent=f.run();
+ assert(absent.q[1]==5);
+ f.mem.erase(Ctx);f.mem.erase(Commands);
+ const auto recorded=capture(absent,f.regs,history,4,read);
+ assert(recorded.source==Source::Submission && recorded.guard==5 &&
+        recorded.head==0x1ec && recorded.tail==0x228 && recorded.mask==0xffff);
+ assert(recorded.words[8]==0x0e009002 && recorded.words[9]==0x22 && recorded.words[10]==0x40000034);
+ assert(capture(absent,f.regs,history,5,read).source==Source::Missing);
+ f.regs[4]^=8;
+ assert(capture(absent,f.regs,history,4,read).source==Source::Missing);
+ f.regs[4]^=8;
+ f.regs[13]^=0x10;
+ assert(capture(absent,f.regs,history,4,read).source==Source::Missing);
+ f.regs[13]^=0x10;
+ history.slots[6].busy=1;
+ assert(capture(absent,f.regs,history,4,read).source==Source::Missing);
+ history.slots[6].busy=0;
+ std::vector<std::string> lines;
+ auto log=[&](const char *format,auto... args) {
+  char line[150];
+  auto n=snprintf(line,sizeof(line),format,args...);
+  assert(n>0 && n<150);
+  lines.emplace_back(line);
+ };
+ write(recorded,log);
+ assert(lines.size()==4 && lines[0].find("source=3 guard=5 ctx=6")!=std::string::npos &&
+        lines[3].find("08: 0e009002 00000022 40000034 00000000")!=std::string::npos);
+ lines.clear();
+ write(capture(absent,f.regs,history,5,read),log);
+ assert(lines.size()==2 && lines[0].find("source=0")!=std::string::npos);
+
+ Fixture wrap;wrap.submittedBlit(0x20);
+ auto wrapRead=[&](uint64_t p,void *o,unsigned n){return wrap.read(p,o,n);};
+ remember(history,Stream,Owner,6,wrapRead);
+ wrap.forgetSlots();
+ auto wrapped=capture(wrap.run(),wrap.regs,history,6,wrapRead);
+ assert(wrapped.source==Source::Submission && wrapped.head==0xfe4 && wrapped.words[8]==0x0e009002);
+ // Partial windows must mark the end of the published command stream.
+ const uint32_t nearTail=0x18;
+ memcpy(wrap.regs,&nearTail,4);
+ wrapped=capture(wrap.run(),wrap.regs,history,6,wrapRead);
+ assert(wrapped.source==Source::Submission && wrapped.mask==0x03ff);
+
+ Fixture other;other.submittedBlit();
+ other.put(Ctx+0x89,uint64_t(9)<<37 | 0x40100319);
+ auto otherRead=[&](uint64_t p,void *o,unsigned n){return other.read(p,o,n);};
+ remember(history,Stream,Owner,8,otherRead);
+ other.forgetSlots();
+ assert(capture(other.run(),other.regs,history,8,otherRead).source==Source::Missing);
+
+ Fixture drift;drift.submittedBlit();
+ unsigned copies=0;
+ auto driftRead=[&](uint64_t p,void *o,unsigned n) {
+  if(p>=Commands && p<Commands+4096 && ++copies==2)drift.put(Commands+0x1ec,uint32_t(0));
+  return drift.read(p,o,n);
+ };
+ remember(history,Stream,Owner,7,driftRead);
+ drift.forgetSlots();
+ assert(capture(drift.run(),drift.regs,history,7,driftRead).source==Source::Missing);
+}
 }
 int main(){
  {Fixture f;auto s=f.run();assert(!s.q[1] && s.q[4]==Ring && s.q[5]==Ctx && s.q[7]==2);}
@@ -81,4 +175,5 @@ int main(){
   auto s=f.run();assert(s.q[1]==5 && !nativeBlitDumpAllowed(s) && !f.window(s).captured);}
  {Fixture f;f.blit();auto s=f.run();f.put(Buffer+0x20,uint64_t(4095));assert(!f.window(s).captured);}
  {Fixture f;f.blit();auto s=f.run();f.put(Ctx+0x50,Owner+8);assert(!f.window(s).captured);}
+ persistentBlitReports();
 }
