@@ -110,6 +110,7 @@ extern "C" __attribute__((naked,used)) void tglHangPreStopBridge() {
 static bool tglHangPreStopReady=false;
 static uint32_t tglHangPreStopState;
 static TGLHangPreStop::Capture tglHangPreStopCapture{};
+static bool tglHangBlitDumpReady;
 static bool tglSameTailEnabled;
 static TGLSameTail::State tglSameTailState{},tglSameTailFailure{};
 static TGLSubmitHistory::History<> tglSubmitHistory;
@@ -12196,9 +12197,13 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			// reuse the native pending resource cache and saved debug registers.
 			const char *hangDump="__ZN20IGHardwareRingBuffer14dumpRingBufferER14debugRegisters";
 			const uint8_t hangHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50};
+			// The donor reads the ring object's buffer but labels it with the saved engine.
+			const uint8_t hangBuffer[] {0x48,0x89,0xF3,0x49,0x89,0xFC,0x48,0x8B,0xBF,0x80,0,0,0,0xE8,0xC4,0xA5,0xFC,0xFF};
 			bool hangOK=tglVM.nofault && size>0x46780 &&
 				patcher.solveSymbol<mach_vm_address_t>(index,hangDump,address,size)==address+0x4657C &&
 				!memcmp(reinterpret_cast<void *>(address+0x4657C),hangHead,sizeof(hangHead));
+			const bool blitDumpLayout=hangOK &&
+				!memcmp(reinterpret_cast<void *>(address+0x4658A),hangBuffer,sizeof(hangBuffer));
 			const auto pgClass=patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV31IGHardwarePerProcessPageTable64",address,size);
 			hangOK=hangOK && pgClass==address+0xCC220 && tglVM.enabled;
 			if (hangOK) tglPPGTTClass=pgClass+16;
@@ -12206,6 +12211,8 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				KernelPatcher::RouteRequest hook[] {{hangDump,wrapTGLHangRingDump,orgTGLHangRingDump}};
 				hangOK=patcher.routeMultiple(index,hook,arrsize(hook),address,size);
 			}
+			tglHangBlitDumpReady=hangOK && blitDumpLayout;
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLHangBlitDumpReady",tglHangBlitDumpReady);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLHangBatchCaptureReady",hangOK);
             // Exact failure-only wake call. Native STOP, wake ownership and all
             // other callers remain unchanged; no instrumentation in normal submits.
@@ -15798,6 +15805,25 @@ void XE::wrapTGLHangRingDump(void *ring,void *registers) {
  };
  static uint32_t calls;
  const auto slot=__atomic_fetch_add(&calls,1U,__ATOMIC_RELAXED);
+ bool nativeDump=true;
+ const auto regs=static_cast<const uint8_t *>(registers);
+ if(tglHangBlitDumpReady && regs[0x94]==TGLHangSelect::Blit) {
+  auto read=[](uint64_t p,void *out,unsigned n)->uint64_t {
+   return TGLHangPending::kernelRange(p,n) ? tglVM.nofault(p,reinterpret_cast<uint64_t>(out),n) : 0;
+  };
+  TGLHangSelect::Selection blit{};
+  TGLHangSelect::select(blit,reinterpret_cast<uint64_t>(ring),
+   reinterpret_cast<uint64_t>(tglCSBEngines[TGLHangSelect::Blit].streamer),regs,read);
+  // Only the ring passed by the native caller may be dereferenced by the
+  // native logger. A matching scheduler slot can supply a nofault witness.
+  nativeDump=TGLHangSelect::nativeBlitDumpAllowed(blit);
+  if(slot<4) {
+   TGLHangSelect::BlitWindow window{};
+   TGLHangSelect::captureBlitWindow(window,blit,regs,read);
+   char key[32];snprintf(key,sizeof(key),"TGLHangBlitWindow%u",slot);
+   IORegistryEntry::getRegistryRoot()->setProperty(key,&window,sizeof(window));
+  }
+ }
  if (slot<4 && tglVM.nofault) {
   if (slot==0) {
    if(__atomic_load_n(&tglHangPreStopState,__ATOMIC_ACQUIRE)==2)
@@ -15861,7 +15887,8 @@ void XE::wrapTGLHangRingDump(void *ring,void *registers) {
      bzero(work,sizeof(*work));auto &pending=work->pending;auto &selection=work->selection;
      tglHostClock(pending.q+1);
      auto boundedRead=[&](uint64_t address,void *out,unsigned count)->uint64_t {return read(address,out,count);};
-     if(tglHangDetailKernel())TGLHangSelect::select(selection,c->q[2],reinterpret_cast<uint64_t>(tglCSBEngines[0].streamer),c->regs,boundedRead);
+     if(tglHangDetailKernel() && c->regs[0x94]==TGLHangSelect::Render)
+      TGLHangSelect::select(selection,c->q[2],reinterpret_cast<uint64_t>(tglCSBEngines[0].streamer),c->regs,boundedRead);
      uint64_t selected=c->q[2];const uint8_t *ringBytes=c->ring;
      if(selection.q[0] && !selection.q[1] && selection.q[4]!=selected) {
       if(read(selection.q[4],work->ring,sizeof(work->ring))==sizeof(work->ring)) {
@@ -15879,7 +15906,7 @@ void XE::wrapTGLHangRingDump(void *ring,void *registers) {
    IOFree(c,sizeof(*c));
   }
  }
- FunctionCast(wrapTGLHangRingDump,callbackXE->orgTGLHangRingDump)(ring,registers);
+ if(nativeDump)FunctionCast(wrapTGLHangRingDump,callbackXE->orgTGLHangRingDump)(ring,registers);
 }
 
 void XE::wrapTGLSurfaceAux(void *resource,void *entry,uint32_t *surface,uint32_t intent) {

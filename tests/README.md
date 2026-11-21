@@ -20,6 +20,15 @@ This CPU check does not execute the donor's callback bodies, Lilu installation,
 IOAccel locking, GPU execution or stamp retirement. The exact donor guards and
 an observed live recovery are required at those boundaries.
 
+`tgl_hang_select` checks failure-only ring provenance. The donor
+`dumpRingBuffer` reads the receiver's mapped ring and labels it with the saved
+engine ID. A Blit report needs the matching context ID, owner, engine and saved
+ring start. Test a stopped Blit engine reported through a render receiver,
+matching native receivers, empty and foreign slots, and command drift across
+the bounded nofault copy. An alternate slot can yield a command snapshot but
+does not authorize a native object call. The check does not model physical GPU
+registers, workloop serialization, kernel object lifetime or a live reset.
+
 Apply these rules to implementation changes and test additions, corrections,
 merges and removals. An existing passing test is not an approved specification.
 The [check inventory](#independent-expectations-and-boundaries) describes selected

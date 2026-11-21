@@ -6,7 +6,8 @@ using namespace TGLHangSelect;
 namespace {
 constexpr uint64_t K=0xffff800000000000ULL,Origin=K+0x1000,Other=K+0x2000,
  Stream=K+0x3000,Item=K+0x4000,Ctx=K+0x5000,Ring=K+0x6000,
- Item2=K+0x7000,Ctx2=K+0x8000,Ring2=K+0x9000,Owner=K+0x10000;
+ Item2=K+0x7000,Ctx2=K+0x8000,Ring2=K+0x9000,Owner=K+0x10000,
+ Descriptor=K+0x11000,LRC=K+0x12000,Buffer=K+0x14000,Commands=K+0x15000;
 struct Fixture {
  std::map<uint64_t,std::vector<uint8_t>> mem;uint8_t regs[176]{};
  unsigned slotReads{};bool changeSlots{},changeOwner{},changeItem{},missingID{};
@@ -28,6 +29,26 @@ struct Fixture {
   if(p-it->first+n>it->second.size())return 0;memcpy(out,it->second.data()+p-it->first,n);return n;
  }
  Selection run(uint64_t origin=Origin){Selection s{};select(s,origin,Stream,regs,[&](uint64_t p,void *o,unsigned n){return read(p,o,n);});return s;}
+ void blit() {
+  for(auto p:{Descriptor,Buffer,Commands})mem[p].resize(4096);
+  mem[LRC].resize(8192);
+  // The report was for an inactive BCS engine while callback 'this' was RCS.
+  regs[0x94]=2;regs[8]=0;
+  pair(Other,Origin,6,0);pair(Ctx,Ring,6,2);
+  put(Stream+0x28,Descriptor);put(Descriptor,uint8_t(2));
+  put(Ring+0x18,LRC);put(LRC+0x1024,uint32_t(0x40000000));
+  put(Ring+0x80,Buffer);put(Ring+0x8c,uint32_t(4096));
+  put(Buffer+0x20,uint64_t(4096));put(Buffer+0x38,Commands);
+  put(Commands+4064,uint32_t(0xa5a5a5a5));put(Commands,uint32_t(0x0e009002));
+ }
+ BlitWindow window(const Selection &s,bool drift=false) {
+  unsigned headReads=0;BlitWindow out{};
+  captureBlitWindow(out,s,regs,[&](uint64_t p,void *o,unsigned n) {
+   if(drift && p==Commands && ++headReads==2)put(Commands,uint32_t(0));
+   return read(p,o,n);
+  });
+  return out;
+ }
 };
 }
 int main(){
@@ -47,4 +68,17 @@ int main(){
  {Fixture f;f.regs[0x94]=1;assert(f.run().q[1]==1);}
  {Fixture f;f.regs[8]=0;assert(f.run().q[1]==1);}
  {Fixture f;memset(f.regs+12,0,4);assert(f.run().q[1]==1);}
+ {Fixture f;f.blit();auto s=f.run();
+  assert(!s.q[1] && s.q[4]==Ring && s.q[7]==2 && !nativeBlitDumpAllowed(s));
+  auto w=f.window(s);
+  assert(w.captured && w.head==0 && w.words[0]==0xa5a5a5a5 && w.words[8]==0x0e009002);
+  assert(!f.window(s,true).captured);}
+ {Fixture f;f.blit();assert(nativeBlitDumpAllowed(f.run(Ring)));}
+ {Fixture f;f.blit();f.put(LRC+0x1024,uint32_t(0x40001000));
+  auto s=f.run();assert(s.q[1] && !nativeBlitDumpAllowed(s) && !f.window(s).captured);}
+ {Fixture f;f.blit();f.put(Descriptor,uint8_t(0));assert(f.run().q[1]==2);}
+ {Fixture f;f.blit();f.put(Stream+0x30,uint64_t(0));f.put(Stream+0x40,uint64_t(0));
+  auto s=f.run();assert(s.q[1]==5 && !nativeBlitDumpAllowed(s) && !f.window(s).captured);}
+ {Fixture f;f.blit();auto s=f.run();f.put(Buffer+0x20,uint64_t(4095));assert(!f.window(s).captured);}
+ {Fixture f;f.blit();auto s=f.run();f.put(Ctx+0x50,Owner+8);assert(!f.window(s).captured);}
 }
