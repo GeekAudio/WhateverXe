@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, codex/wex-compiler-access-diagnostics]
     tags: ['*']
   pull_request:
   workflow_dispatch:

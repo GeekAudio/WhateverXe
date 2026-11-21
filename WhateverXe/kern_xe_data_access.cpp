@@ -114,15 +114,22 @@ bool XeDataAccess::processKext(KernelPatcher &p, size_t index, mach_vm_address_t
         open-address <= size-32 && map-address <= size-32 &&
         !memcmp(reinterpret_cast<void *>(open), openPrefix, sizeof(openPrefix)) &&
         !memcmp(reinterpret_cast<void *>(map), mapPrefix, sizeof(mapPrefix));
+    auto routeError = KernelPatcher::Error::NoError;
     if (known) {
         KernelPatcher::RouteRequest routes[] {
             {"_hook_vnode_check_open", checkOpen, originalOpen},
             {"_hook_file_check_mmap", checkMap, originalMap}
         };
         ready = p.routeMultiple(index, routes, arrsize(routes), address, size);
+        routeError = p.getError();
         p.clearError();
     }
-    IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeDataAccess", ready);
+    auto root = IORegistryEntry::getRegistryRoot();
+    root->setProperty("WhateverXeDataAccessOpenResolved", open != 0);
+    root->setProperty("WhateverXeDataAccessMapResolved", map != 0);
+    root->setProperty("WhateverXeDataAccessEntryMatched", known);
+    root->setProperty("WhateverXeDataAccessRouteError", static_cast<uint64_t>(routeError), 32);
+    root->setProperty("WhateverXeDataAccess", ready);
     SYSLOG("wex", "GPU Data access ready=%d", ready);
     return true;
 }
