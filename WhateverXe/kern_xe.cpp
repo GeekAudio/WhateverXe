@@ -12927,6 +12927,18 @@ bool XE::processFramebufferKext(KernelPatcher &patcher,size_t index,mach_vm_addr
  KernelPatcher::RouteRequest gate(symbol,wrapFramebufferStart,orgFramebufferStart);
  const bool routed=patcher.routeMultiple(index,&gate,1,address,size);patcher.clearError();
  if(!routed)return false;
+ if (checkKernelArgument("-wex-adls-headless-pm")) {
+  using namespace XELPDonor::HeadlessPM;
+  auto image=reinterpret_cast<const uint8_t *>(address);
+  bool ready=adlsDisplaySelected && XELP::kernelOS(version)==XELP::OS::Tahoe && matches(image,size);
+  if (ready) {
+   patcher.routeBlock(address+Branch,FallThrough,sizeof(FallThrough));
+   ready=patcher.getError()==KernelPatcher::Error::NoError &&
+    !memcmp(image+Branch,FallThrough,sizeof(FallThrough));
+   patcher.clearError();
+  }
+  IORegistryEntry::getRegistryRoot()->setProperty("ADLSHeadlessPMNotificationPatched",ready);
+ }
  if(display13FramebufferRequested)
   processDisplay13Shutdown(patcher,index,address,size);
 

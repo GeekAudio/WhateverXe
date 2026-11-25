@@ -18,6 +18,21 @@ inline bool ddiReleaseSite(const uint8_t *image,size_t size) {
  return image && size>=DDIReleaseOffset+sizeof(DDIReleaseBefore) &&
   !memcmp(image+DDIReleaseOffset,DDIReleaseBefore,sizeof(DDIReleaseBefore));
 }
+// The framebuffer count includes unopened framebuffer objects. For a qualified
+// headless configuration, allow the controller to register native PM notifications
+// even when those objects exist. An unopened pipe cannot relay system wake.
+namespace HeadlessPM {
+constexpr size_t Site = 0x409A7;
+constexpr size_t Branch = Site + 4;
+constexpr uint8_t Before[] {
+    0x41,0x83,0x3F,0x00,0x75,0x17,0x48,0xFF,0x05,0x9C,0xC2,0x09,0x00,
+    0x4C,0x89,0xEF,0xE8,0x70,0x67,0xFE,0xFF,0x4C,0x89,0xEF,0xE8,0x06,0x4C,0x03,0x00
+};
+constexpr uint8_t FallThrough[] {0x90,0x90};
+inline bool matches(const uint8_t *image,size_t size) {
+    return image && size >= Site + sizeof(Before) && !memcmp(image + Site, Before, sizeof(Before));
+}
+}
 inline bool displayPoolRequest(uint32_t enabled,uint32_t bytes) {
     return enabled && bytes && !(bytes&4095) && bytes<=0x4000000;
 }
