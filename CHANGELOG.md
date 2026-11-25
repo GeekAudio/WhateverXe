@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.6
+
+### Fixed
+
+- Restore native power notifications for headless Alder Lake-S graphics on macOS Tahoe so the integrated GPU can resume processing graphics work after system sleep.
+
+### Configuration
+
+- Enable the experimental `-wex-adls-headless-pm` boot argument only when all displays are connected to the discrete GPU. Intermittent post-wake Intel GPU stalls remain under investigation.
+
 ## 0.8.5
 
 Update WhateverXe to 0.8.5 and keep WhateverXe Graphics at 0.4.5.
