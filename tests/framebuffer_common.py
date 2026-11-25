@@ -18,14 +18,29 @@ struct {void *lock=(void*)1;XELPComboClock::ClockAllocation allocation;} comboCl
 #include <fstream>
 #include <iterator>
 #include <cstdio>
+#include "kern_xelp_donor.hpp"
+#include "kern_xelp_os.hpp"
 using mach_vm_address_t=uintptr_t;
 void IORecursiveLockLock(void*){}void IORecursiveLockUnlock(void*){}
 struct IOService {void setProperty(const char*,bool) {}};
 struct IORegistryEntry {
+ static bool headlessPMPropertySeen,headlessPMPropertyValue;
  static IORegistryEntry *getRegistryRoot(){static IORegistryEntry r;return &r;}
+ void setProperty(const char *name,bool value) {
+  if(!strcmp(name,"ADLSHeadlessPMNotificationPatched")) {
+   headlessPMPropertySeen=true;headlessPMPropertyValue=value;
+  }
+ }
  template<class...T>void setProperty(T...){}
 };
+bool IORegistryEntry::headlessPMPropertySeen=false;
+bool IORegistryEntry::headlessPMPropertyValue=false;
 bool surfaceOK=true,nvramOK=true,tglSonomaSurfaceFramebufferReady=false;
+bool headlessPMOptIn=false;
+const char *version="Darwin Kernel Version 25.6.0: Tue Aug 18 17:46:40 PDT 2026; root:xnu-12377.161.15.700.19~2/RELEASE_X86_64";
+bool checkKernelArgument(const char *name) {
+ return headlessPMOptIn && !strcmp(name,"-wex-adls-headless-pm");
+}
 uintptr_t offset(const char *s){
  if(strstr(s,"5start"))return 0x3f1fc;
  if(strstr(s,"__ZTV"))return 0xccad0;
@@ -55,6 +70,7 @@ struct XE {
  bool display13FramebufferRequested=false,tglPlatformNVRAMReady=false,tglProbeReady=false,tglFramebufferInitReady=false;
  void *tglPathPoolLock=(void*)1,*framebufferStartedController=nullptr;bool framebufferStartInProgress=false,tglLeasesStopping=false;
  bool runtimeOK=true,agdcOK=true,backendOK=true,trainingOK=true,framebufferTrainingHooksReady=false;
+ bool adlsDisplaySelected=false;
  uintptr_t orgFramebufferStart=0,orgFramebufferInit=0,orgFramebufferComputeLanes=0,framebufferLaneCaller=0;
  uintptr_t xelpProviderProbe=0x2000,xelpProviderConfigureProbe=0x3000;
  unsigned commonRuntimeCalls=0,backendCalls=0,startCalls=0;bool stopDuringStart=false,nativeOK=true;
@@ -77,10 +93,38 @@ struct XE {
 XE *callbackXE;
 bool XE::wrapDisplay13FramebufferStart(IOService*,IOService*){assert(callbackXE->display13FramebufferRequested);assert(!callbackXE->framebufferStartedController);if(callbackXE->stopDuringStart)callbackXE->tglLeasesStopping=true;++callbackXE->startCalls;return callbackXE->nativeOK;}
 bool XE::wrapTGLFramebufferStart(IOService*,IOService*){assert(!callbackXE->display13FramebufferRequested);assert(!callbackXE->framebufferStartedController);if(callbackXE->stopDuringStart)callbackXE->tglLeasesStopping=true;++callbackXE->startCalls;return callbackXE->nativeOK;}
+static void checkHeadlessPMCase(const std::vector<uint8_t> &original,bool optIn,bool adls,
+                                const char *kernel,bool exact,bool routeFailure,bool patched) {
+ using namespace XELPDonor::HeadlessPM;
+ auto image=original;
+ if(!exact)image[Site]^=1;
+ if(exact)assert(matches(image.data(),image.size()));
+ else assert(!matches(image.data(),image.size()));
+ headlessPMOptIn=optIn;version=kernel;
+ IORegistryEntry::headlessPMPropertySeen=false;IORegistryEntry::headlessPMPropertyValue=false;
+ shutdownCalls=0;
+ uintptr_t pure=0x1234;memcpy(image.data()+0xccad0+0x188,&pure,sizeof(pure));
+ XE x;callbackXE=&x;x.adlsDisplaySelected=adls;KernelPatcher patcher;
+ if(routeFailure)patcher.failAt=2; // gate hook succeeds; the PM branch write fails
+ const bool handled=x.processFramebufferKext(patcher,1,reinterpret_cast<uintptr_t>(image.data()),image.size());
+ assert(handled && x.framebufferDonorCommonReady && x.framebufferBackendInstalled && x.backendCalls==1);
+ assert(shutdownCalls==0);
+ assert(IORegistryEntry::headlessPMPropertySeen==optIn);
+ if(optIn)assert(IORegistryEntry::headlessPMPropertyValue==patched);
+ assert((memcmp(image.data()+Branch,FallThrough,sizeof(FallThrough))==0)==patched);
+ if(patched) {
+  constexpr size_t after=Branch-Site+sizeof(FallThrough);
+  assert(!memcmp(image.data()+Site+after,Before+after,sizeof(Before)-after));
+ } else if(exact) assert(!memcmp(image.data()+Site,Before,sizeof(Before)));
+ if(routeFailure)assert(patcher.attempts>=2);
+}
 FUNCTIONS
 int main(int argc,char **argv){
+ using namespace XELPDonor::HeadlessPM;
  std::vector<uint8_t> image(0x150000);
  if(argc>1){std::ifstream f(argv[1],std::ios::binary);image.assign(std::istreambuf_iterator<char>(f),{});assert(image.size()>0xcccd8);}
+ else memcpy(image.data()+Site,Before,sizeof(Before));
+ if(argc>1)assert(matches(image.data(),image.size()));
  const uint8_t start[]={START},init[]={INIT},lane[]={LANE},call[]={CALL},hal[]={HAL};
  for(auto span: {std::pair<unsigned,std::vector<uint8_t>>{0x3f1fc,{start,start+sizeof(start)}},
   {0x29ec8,{init,init+sizeof(init)}},{0x1fc22,{lane,lane+sizeof(lane)}},
@@ -117,6 +161,14 @@ int main(int argc,char **argv){
   assert(shutdownCalls==(display13 && failure!=1?1U:0U));
   assert(p.attempts==calls&&x.backendCalls==backends); // no second trampoline
  }
+ const char *tahoe="Darwin Kernel Version 25.6.0: Tue Aug 18 17:46:40 PDT 2026; root:xnu-12377.161.15.700.19~2/RELEASE_X86_64";
+ const char *sequoia="Darwin Kernel Version 24.6.1: future servicing; root:xnu-future/RELEASE_X86_64";
+ checkHeadlessPMCase(image,false,true,tahoe,true,false,false); // no opt-in: no property or write
+ checkHeadlessPMCase(image,true,true,tahoe,true,false,true);   // qualified ADL-S Tahoe donor
+ checkHeadlessPMCase(image,true,false,tahoe,true,false,false); // another selected family
+ checkHeadlessPMCase(image,true,true,sequoia,true,false,false); // wrong OS
+ checkHeadlessPMCase(image,true,true,tahoe,false,false,false); // donor bytes drifted
+ checkHeadlessPMCase(image,true,true,tahoe,true,true,false);  // failed patch route
  puts("PASS common-before-backend order, single ownership, partial failures and mandatory native-start gate");
 }
 '''.replace('FUNCTIONS',f)

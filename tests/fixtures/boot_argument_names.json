@@ -107,6 +107,7 @@
     "-adlnscanout",
     "-n97scanout"
   ],
+  "-wex-adls-headless-pm": [],
   "-wex-adln-task-stage": [
     "-adlntaskstage",
     "-n97taskstage"
